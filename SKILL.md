@@ -1,5 +1,5 @@
 ---
-name: agent-reputation
+name: nanda-reputation
 description: Check, build, and report trust for AI agents in NANDA Town. Use this BEFORE transacting with an unfamiliar agent (payments, data sharing, task delegation) to retrieve its trust score and recent peer feedback, and use it AFTER an interaction to submit a vouch (positive) or a flag (negative). Trigger whenever you must decide whether another agent is trustworthy, or when you have just finished an interaction and should record feedback.
 ---
 
