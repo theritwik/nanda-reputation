@@ -10,6 +10,7 @@ in-memory store if Redis env vars are not set, so it also runs locally.
 """
 
 import os
+import re
 import json
 import time
 import urllib.request
@@ -72,6 +73,59 @@ def _score(record):
     return round((v + 1) / (total + 2), 3)
 
 
+def _now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+# --- Validation ------------------------------------------------------------
+
+# NANDA agent IDs look like: agent://nanda/<non-empty-identifier>
+AGENT_ID_RE = re.compile(r"^agent://nanda/[A-Za-z0-9_.\-]+$")
+
+MAX_TEXT_LEN = 500
+
+
+def decode_agent_id(raw):
+    """Percent-decode an agent id.
+
+    Path segments and JSON body values may arrive percent-encoded
+    (e.g. ``agent%3A%2F%2Fnanda%2Fritwik``) depending on the WSGI/HTTP
+    layer in front of the app. ``unquote`` is idempotent on strings that
+    are already decoded, so it's always safe to call.
+    """
+    if raw is None:
+        return raw
+    return urllib.parse.unquote(raw)
+
+
+def is_valid_agent_id(agent_id):
+    return bool(agent_id) and bool(AGENT_ID_RE.match(agent_id))
+
+
+def _validate_text_field(value, field_name, required):
+    """Validate an optional/required free-text field, max 500 chars."""
+    if value is None or value == "":
+        if required:
+            return None, f"Missing required field '{field_name}'."
+        return "", None
+    if not isinstance(value, str):
+        return None, f"Field '{field_name}' must be a string."
+    if len(value) > MAX_TEXT_LEN:
+        return None, (
+            f"Field '{field_name}' must be at most {MAX_TEXT_LEN} characters."
+        )
+    return value, None
+
+
+# --- Security headers ------------------------------------------------------
+
+@app.after_request
+def _add_security_headers(response):
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 # --- Routes --------------------------------------------------------------
 
 @app.route("/", methods=["GET"])
@@ -81,16 +135,30 @@ def home():
         "description": "A trust layer for AI agents. Check an agent before "
                        "you transact; vouch or flag it after.",
         "endpoints": {
+            "GET /health": "Health check",
             "GET /reputation/<agent_id>": "Get an agent's trust score",
             "POST /reputation/<agent_id>/vouch": "Record positive feedback",
             "POST /reputation/<agent_id>/flag": "Record negative feedback",
         },
+        "agent_id_format": "agent://nanda/<non-empty-identifier>",
         "skill": "See SKILL.md in the repository.",
     })
 
 
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok"})
+
+
 @app.route("/reputation/<path:agent_id>", methods=["GET"])
 def get_reputation(agent_id):
+    agent_id = decode_agent_id(agent_id)
+    if not is_valid_agent_id(agent_id):
+        return jsonify({
+            "error": "Invalid agent_id. Expected format: "
+                     "agent://nanda/<non-empty-identifier>",
+        }), 400
+
     record = _load(agent_id)
     total = record["vouches"] + record["flags"]
     return jsonify({
@@ -105,17 +173,36 @@ def get_reputation(agent_id):
 
 @app.route("/reputation/<path:agent_id>/vouch", methods=["POST"])
 def vouch(agent_id):
+    agent_id = decode_agent_id(agent_id)
+    if not is_valid_agent_id(agent_id):
+        return jsonify({
+            "error": "Invalid agent_id. Expected format: "
+                     "agent://nanda/<non-empty-identifier>",
+        }), 400
+
     body = request.get_json(silent=True) or {}
-    sender = body.get("from")
+    sender = decode_agent_id(body.get("from"))
     if not sender:
         return jsonify({"error": "Missing required field 'from' "
                                  "(your own NANDA ID)."}), 400
+    if not is_valid_agent_id(sender):
+        return jsonify({
+            "error": "Invalid 'from'. Expected format: "
+                     "agent://nanda/<non-empty-identifier>",
+        }), 400
+    if sender == agent_id:
+        return jsonify({"error": "Cannot vouch for yourself."}), 400
+
+    note, err = _validate_text_field(body.get("note"), "note", required=False)
+    if err:
+        return jsonify({"error": err}), 400
+
     record = _load(agent_id)
     record["vouches"] += 1
     record["recent"].append({
         "from": sender,
         "type": "vouch",
-        "note": body.get("note", ""),
+        "note": note,
         "ts": _now(),
     })
     record["recent"] = record["recent"][-20:]
@@ -125,17 +212,36 @@ def vouch(agent_id):
 
 @app.route("/reputation/<path:agent_id>/flag", methods=["POST"])
 def flag(agent_id):
+    agent_id = decode_agent_id(agent_id)
+    if not is_valid_agent_id(agent_id):
+        return jsonify({
+            "error": "Invalid agent_id. Expected format: "
+                     "agent://nanda/<non-empty-identifier>",
+        }), 400
+
     body = request.get_json(silent=True) or {}
-    sender = body.get("from")
+    sender = decode_agent_id(body.get("from"))
     if not sender:
         return jsonify({"error": "Missing required field 'from' "
                                  "(your own NANDA ID)."}), 400
+    if not is_valid_agent_id(sender):
+        return jsonify({
+            "error": "Invalid 'from'. Expected format: "
+                     "agent://nanda/<non-empty-identifier>",
+        }), 400
+    if sender == agent_id:
+        return jsonify({"error": "Cannot flag yourself."}), 400
+
+    reason, err = _validate_text_field(body.get("reason"), "reason", required=True)
+    if err:
+        return jsonify({"error": err}), 400
+
     record = _load(agent_id)
     record["flags"] += 1
     record["recent"].append({
         "from": sender,
         "type": "flag",
-        "reason": body.get("reason", ""),
+        "reason": reason,
         "ts": _now(),
     })
     record["recent"] = record["recent"][-20:]
@@ -143,10 +249,6 @@ def flag(agent_id):
     return jsonify({"status": "recorded", "new_score": _score(record)})
 
 
-def _now():
-    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
 # Vercel looks for `app`. This also lets you run it locally with `python api/index.py`.
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5000, debug=False)
